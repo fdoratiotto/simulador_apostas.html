@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Simulador de Apostas (Monte Carlo) + Kelly Criterion</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 20px; color:#111; }
+    h1 { margin-bottom: 8px; }
+    .grid { display:grid; grid-template-columns: 1fr 420px; gap:20px; align-items:start; }
+    .card { padding:16px; border:1px solid #e3e3e3; border-radius:8px; background:#fff; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+    label { display:block; margin:8px 0 4px; font-size:0.95rem; }
+    input[type="number"], input[type="text"], select { width:100%; padding:8px; font-size:1rem; border:1px solid #ccc; border-radius:6px; }
+    button { margin-top:12px; padding:10px 14px; font-size:1rem; border-radius:6px; border:0; background:#0066cc; color:white; cursor:pointer; }
+    button:active{ transform:translateY(1px); }
+    .stats { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; }
+    .stat { padding:10px; border-radius:6px; background:#f7f9fc; min-width:120px; text-align:center; }
+    small.note { color:#666; display:block; margin-top:8px; }
+    footer { margin-top:18px; font-size:0.85rem; color:#666; }
+    @media(max-width:900px){ .grid{ grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>Simulador de Apostas (Monte Carlo) + Kelly Criterion</h1>
+  <p>Ferramenta educativa — simula o comportamento estatístico de uma estratégia de apostas e calcula a fração ótima segundo Kelly (teoria). Não garante ganhos.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Parâmetros da Simulação</h3>
+
+      <label for="prob">Probabilidade de vitória (p) — ex: 0.48</label>
+      <input id="prob" type="number" min="0" max="1" step="0.001" value="0.48" />
+
+      <label for="payout">Payout (multiplicador recebido quando ganha) — ex: 2.0 (ganha 2×)</label>
+      <input id="payout" type="number" min="0.01" step="0.01" value="2.0" />
+
+      <label for="stake">Aposta por rodada (R$)</label>
+      <input id="stake" type="number" min="0.01" step="0.01" value="1.00" />
+
+      <label for="rounds">Rodadas por experimento</label>
+      <input id="rounds" type="number" min="1" step="1" value="100" />
+
+      <label for="experiments">Número de experimentos (simulações independentes)</label>
+      <input id="experiments" type="number" min="1" step="1" value="5000" />
+
+      <label for="seed">Semente aleatória (opcional, vazio = rand)</label>
+      <input id="seed" type="text" placeholder="ex: 12345" />
+
+      <button id="run">Rodar simulação</button>
+
+      <div class="stats" id="stats">
+        <!-- estatísticas aparecem aqui -->
+      </div>
+
+      <small class="note">Resultado mostrado é lucro líquido por experimento (R$). Percentis e média ajudam a entender risco/variância.</small>
+    </div>
+
+    <div class="card">
+      <h3>Histograma de resultados</h3>
+      <canvas id="histogram" height="240"></canvas>
+
+      <h3 style="margin-top:18px">Kelly Criterion</h3>
+      <label for="kelly_b">Probabilidade de vitória (p)</label>
+      <input id="kelly_p" type="number" min="0" max="1" step="0.001" value="0.48" />
+      <label for="kelly_b">Odds (b) — lucro por 1 apostado (ex: payout 2.0 → b = 1.0)</label>
+      <input id="kelly_b_in" type="number" min="0" step="0.01" value="1.0" />
+      <button id="calc_kelly">Calcular Kelly</button>
+
+      <div id="kelly_out" style="margin-top:10px;"></div>
+      <small class="note">Kelly (f*) = (bp - q) / b, onde q = 1-p. Fração <em>f*</em> indica proporção do bankroll sugerida (teoria). Use com cautela.</small>
+    </div>
+  </div>
+
+  <footer>
+    Dica: altere parâmetros e compare percentil 5% / 95% para ver o risco. Esta ferramenta é educacional.
+  </footer>
+
+  <script>
+    // Utilidades
+    function seededRandom(seed) {
+      // LCG simples (32-bit)
+      let s = 0;
+      for (let i = 0; i < seed.length; i++) s = (s * 31 + seed.charCodeAt(i)) >>> 0;
+      return function() {
+        s = (1664525 * s + 1013904223) >>> 0;
+        return (s & 0xFFFFFFFF) / 0x100000000;
+      };
+    }
+
+    function percentile(arr, p) {
+      if (arr.length === 0) return null;
+      const sorted = arr.slice().sort((a,b)=>a-b);
+      const idx = (sorted.length - 1) * p/100;
+      const lo = Math.floor(idx), hi = Math.ceil(idx);
+      if (lo === hi) return sorted[lo];
+      return sorted[lo] * (hi - idx) + sorted[hi] * (idx - lo);
+    }
+
+    function mean(arr) {
+      if (arr.length === 0) return 0;
+      return arr.reduce((a,b)=>a+b,0)/arr.length;
+    }
+
+    function median(arr) { return percentile(arr,50); }
+
+    // Chart
+    let chart = null;
+    function drawHistogram(values) {
+      // bins
+      const bins = 40;
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const width = max - min || 1;
+      const counts = new Array(bins).fill(0);
+      values.forEach(v => {
+        const i = Math.min(bins-1, Math.floor((v - min)/width * bins));
+        counts[i]++;
+      });
+      const labels = counts.map((_,i) => {
+        const a = min + (i/ bins) * width;
+        const b = min + ((i+1)/ bins) * width;
+        return (a.toFixed(2) + ' → ' + b.toFixed(2));
+      });
+
+      const ctx = document.getElementById('histogram').getContext('2d');
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Frequência (experimentos)',
+            data: counts,
+            borderWidth: 0.5
+          }]
+        },
+        options: {
+          maintainAspectRatio: false,
+          scales: { x: { ticks: { maxRotation: 90, minRotation: 45 }, title: { display: false } }, y: { beginAtZero:true } }
+        }
+      });
+    }
+
+    // Simulação
+    document.getElementById('run').addEventListener('click', () => {
+      const p = parseFloat(document.getElementById('prob').value);
+      const payout = parseFloat(document.getElementById('payout').value);
+      const stake = parseFloat(document.getElementById('stake').value);
+      const rounds = parseInt(document.getElementById('rounds').value, 10);
+      const experiments = parseInt(document.getElementById('experiments').value, 10);
+      const seedVal = document.getElementById('seed').value.trim();
+
+      if (!(p >= 0 && p <= 1) || payout <= 0 || stake <= 0 || rounds < 1 || experiments < 1) {
+        alert('Verifique os parâmetros.');
+        return;
+      }
+
+      const prng = seedVal ? seededRandom(seedVal) : Math.random;
+      const totals = new Array(experiments).fill(0);
+
+      for (let e = 0; e < experiments; e++) {
+        let total = 0;
+        for (let r = 0; r < rounds; r++) {
+          const win = prng() < p;
+          if (win) {
+            total += stake * (payout - 1); // lucro líquido
+          } else {
+            total -= stake;
+          }
+        }
+        totals[e] = total;
+      }
+
+      // estatísticas
+      const avg = mean(totals);
+      const med = median(totals);
+      const p5 = percentile(totals,5);
+      const p95 = percentile(totals,95);
+      const min = Math.min(...totals), max = Math.max(...totals);
+      const varr = totals.reduce((acc,x)=>acc + Math.pow(x-avg,2),0)/(totals.length-1 || 1);
+      const sd = Math.sqrt(varr);
+
+      const statsDiv = document.getElementById('stats');
+      statsDiv.innerHTML = `
+        <div class="stat"><strong>Média</strong><div>R$ ${avg.toFixed(2)}</div></div>
+        <div class="stat"><strong>Mediana</strong><div>R$ ${med.toFixed(2)}</div></div>
+        <div class="stat"><strong>5% Percentil</strong><div>R$ ${p5.toFixed(2)}</div></div>
+        <div class="stat"><strong>95% Percentil</strong><div>R$ ${p95.toFixed(2)}</div></div>
+        <div class="stat"><strong>Min / Max</strong><div>R$ ${min.toFixed(2)} / R$ ${max.toFixed(2)}</div></div>
+        <div class="stat"><strong>Desvio-padrão</strong><div>R$ ${sd.toFixed(2)}</div></div>
+      `;
+
+      drawHistogram(totals);
+    });
+
+    // Kelly
+    document.getElementById('calc_kelly').addEventListener('click', () => {
+      const p = parseFloat(document.getElementById('kelly_p').value);
+      const b = parseFloat(document.getElementById('kelly_b_in').value);
+      if (!(p >= 0 && p <= 1) || b <= 0) {
+        alert('Verifique p e b.');
+        return;
+      }
+      const q = 1 - p;
+      const fstar = (b * p - q) / b;
+      const out = document.getElementById('kelly_out');
+      const fDisplay = (fstar <= 0) ? 'Kelly negativo ou zero — não apostar segundo Kelly.' : (fstar > 1 ? '>100% do bankroll (extremo) — indicado ajustar/fracionar' : ( (fstar*100).toFixed(2) + '%' ));
+      out.innerHTML = `<div><strong>f* (Kelly):</strong> ${isFinite(fstar) ? fstar.toFixed(4) : 'N/A'} (${fDisplay})</div>
+        <div style="margin-top:8px;">Interpretação: fração do bankroll sugerida. Muitos praticantes usam "fractional Kelly" (ex: metade de Kelly) para reduzir variância.</div>`;
+    });
+
+    // Inicializa gráfico vazio
+    drawHistogram([0,0]);
+  </script>
+</body>
+</html>
